@@ -19,10 +19,16 @@ const MODEL = process.env.MIMOE_MODEL ?? "smollm2-360m";   // exact model id fro
 const MAX_STEPS = Number(process.env.MAX_STEPS ?? 5);      // guard against infinite tool loops
 const DEBUG = process.env.DEBUG === "1";
 const THINKING = process.env.THINKING === "1";             // Qwen3 reasoning mode (slower, uses more context)
+const MAX_TOKENS = Number(process.env.MAX_TOKENS ?? 512);  // cap each reply so it can't overflow the context
+// ~3.5 chars per token: 4000 chars of history + tool schemas + a 512-token reply fit in a 2048-token context.
+const MAX_HISTORY_CHARS = Number(process.env.MAX_HISTORY_CHARS ?? 4000);
 
 const client = new OpenAI({ baseURL: BASE_URL, apiKey: API_KEY });
 
+const TODAY = new Date().toLocaleDateString("en-US", { dateStyle: "full" });
+
 export const SYSTEM_PROMPT = `You are a helpful assistant running locally on the user's device.
+Today is ${TODAY}.
 You can use these tools: calculator, get_current_time, search_notes.
 Use a tool when the question needs exact math, the current time, or the user's notes.
 The user keeps notes about their appointments, meetings, team routines and deadlines.
@@ -37,7 +43,7 @@ const log = (...args) => DEBUG && console.error("[debug]", ...args);
 
 // Reasoning models like Qwen3 wrap their thinking in <think>...</think>.
 // Strip it so the user sees only the answer and it doesn't fill the small
-// on-device context window (4096 tokens here) on later turns.
+// on-device context window (2048 tokens on a 2 GB GPU) on later turns.
 export function stripThinking(content) {
   return (content ?? "").replace(/<think>[\s\S]*?(<\/think>|$)/g, "").trim();
 }
@@ -58,9 +64,38 @@ export function parseTextToolCall(content) {
   return null;
 }
 
+// Small models sometimes skip their tools: they *say* they'll use one
+// ("Let me check your notes") without calling it, or ask the user for
+// information the notes already hold. Spot that so the loop can nudge them once.
+export function skippedTools(content) {
+  const text = content ?? "";
+  const announces =
+    /\b(let me|i'll|i will|i should|i need to|i can)\b.{0,40}\b(check|search|look|calculat|find)/i;
+  const asksUser =
+    /(please provide|could you (please )?(share|provide|tell)|i need to know|not (provided|available|specified|recorded|mentioned)|i don't have (any )?information)/i;
+  return announces.test(text) || asksUser.test(text);
+}
+
+// Keep the conversation inside the small context window: drop whole oldest
+// turns (each starts at a user message), always keeping the system prompt and
+// the current turn. Turns are dropped whole so a tool result is never
+// separated from the assistant message that requested it.
+export function trimHistory(history, maxChars = MAX_HISTORY_CHARS) {
+  const size = () => history.reduce((n, m) => n + JSON.stringify(m).length, 0);
+  while (size() > maxChars) {
+    const nextTurn = history.findIndex((m, i) => i > 1 && m.role === "user");
+    if (nextTurn === -1) break; // only the current turn left
+    history.splice(1, nextTurn - 1);
+  }
+  return history;
+}
+
 // One agent turn: think -> (maybe) act with a tool -> observe -> answer.
 export async function runAgent(userInput, history) {
   history.push({ role: "user", content: userInput });
+  trimHistory(history);
+  let usedTool = false;
+  let nudged = false;
 
   for (let step = 0; step < MAX_STEPS; step++) {
     const response = await client.chat.completions.create({
@@ -68,6 +103,7 @@ export async function runAgent(userInput, history) {
       messages: history,
       tools: TOOL_SCHEMAS,
       temperature: 0.2, // low temperature = more reliable tool use from small models
+      max_tokens: MAX_TOKENS,
     });
     const msg = response.choices[0].message;
     log(`step ${step}:`, JSON.stringify(msg));
@@ -89,6 +125,7 @@ export async function runAgent(userInput, history) {
         console.log(`  🔧 ${call.function.name}(${JSON.stringify(args)}) -> ${result}`);
         history.push({ role: "tool", tool_call_id: call.id, content: result });
       }
+      usedTool = true;
       continue;
     }
 
@@ -102,10 +139,23 @@ export async function runAgent(userInput, history) {
         role: "user",
         content: `Tool result for ${parsed.name}: ${result}\nNow answer the original question in plain text.`,
       });
+      usedTool = true;
       continue;
     }
 
-    // Path 3: final answer
+    // Path 3: the model skipped its tools (see skippedTools). Nudge once.
+    if (!usedTool && !nudged && skippedTools(msg.content)) {
+      log("model answered without using its tools; nudging");
+      nudged = true;
+      history.push({ role: "assistant", content: msg.content });
+      history.push({
+        role: "user",
+        content: "Don't ask me. Use your tools (e.g. search_notes) to find out, then answer.",
+      });
+      continue;
+    }
+
+    // Path 4: final answer
     const answer = msg.content;
     history.push({ role: "assistant", content: answer });
     return answer;

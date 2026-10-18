@@ -76,11 +76,15 @@ export function getCurrentTime() {
 export function searchNotes({ query }) {
   if (!existsSync(NOTES_FILE)) return "No notes file found.";
   const words = String(query).toLowerCase().split(/\s+/).filter((w) => w.length > 2);
-  const hits = readFileSync(NOTES_FILE, "utf8")
+  const notes = readFileSync(NOTES_FILE, "utf8")
     .split("\n")
     .map((l) => l.trim())
-    .filter((l) => l && words.some((w) => l.toLowerCase().includes(w)));
-  return hits.length ? hits.slice(0, 5).join("\n") : "No matching notes.";
+    .filter(Boolean);
+  const hits = notes.filter((l) => words.some((w) => l.toLowerCase().includes(w)));
+  if (hits.length) return hits.slice(0, 5).join("\n");
+  // Keyword search misses vague queries like "tomorrow". The notes file is
+  // small, so hand the model all of it and let it pick what's relevant.
+  return `No exact match. All notes:\n${notes.slice(0, 10).join("\n")}`;
 }
 
 const TOOLS = {

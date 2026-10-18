@@ -35,7 +35,7 @@ Requires Node.js 18+.
 
 1. Install and open **mimOE Studio**. Go to **AI Models -> On Device** and download
    **qwen3-1.7b** (listed as "tool use support").
-2. Load it. On a small GPU, set the **context size to 4096** first (see "What I observed").
+2. Load it. On a small GPU, set the **context size to 2048** first (4096 if you have more than 2 GB VRAM) (see "What I observed").
 3. Click the **API** button and note the base URL, API key, and model id.
 3. Then:
 ```bash
@@ -59,11 +59,22 @@ Set `DEBUG=1` in `.env` to see raw model responses, and `THINKING=1` to let Qwen
   never execute model output. `MAX_STEPS` prevents infinite tool loops.
 - **Low temperature (0.2)** for more consistent tool selection.
 - **Strip `<think>` blocks.** Qwen3 is a reasoning model. Its thinking is removed from
-  the answer and from the chat history, so it doesn't fill the 4096-token context on
+  the answer and from the chat history, so it doesn't fill the small (2048-token) context on
   later turns. `THINKING=0` (default) appends Qwen3's `/no_think` switch for speed.
 - **Tool descriptions are part of the prompt.** With a 1.7B model, wording mattered more
   than code: changing `search_notes` to "use for ANY question about the user's own
   appointments, schedule..." fixed a case where the model answered from the clock instead.
+- **Guardrails in the loop, not just the prompt.** A 1.7B model ignores instructions
+  sometimes, so the loop enforces three rules in code:
+  - **Nudge once.** If the model answers without a tool but either announces one ("Let me
+    check your notes") or asks the user for information ("please provide your schedule"),
+    the loop tells it to use its tools and tries again.
+  - **Trim the history.** The oldest whole turns are dropped to keep the chat inside the
+    context window. A tool result is never separated from the call that requested it.
+  - **Cap replies** with `max_tokens` (512).
+- **Today's date is in the system prompt**, so "tomorrow" means something to the model.
+  `search_notes` returns all notes when no keyword matches. The file is tiny, and keyword
+  search can't resolve vague queries like "tomorrow".
 - **Config via `.env`**, never committed.
 
 ## What I observed / limitations
@@ -75,8 +86,7 @@ Tested on a Windows 11 laptop: 16 GB RAM, **NVIDIA MX150 with 2 GB VRAM**.
   for reliable function calling.
 - **Load failed: `failed to create the llama_context`.** Studio's default context was 12000
   tokens. The KV cache for that (~1.3 GB) plus the weights (~1.1 GB) doesn't fit in 2 GB of
-  VRAM. Lowering context to **4096** fixed it. `GET /mimik-ai/openai/v1/models` confirms
-  `max_context: 4096`, all layers on GPU, ~28 tokens/s.
+  VRAM. Lowering context to **4096** made it load (~28 tokens/s, all layers on GPU).
 - **The endpoint really is OpenAI-compatible.** The official `openai` npm SDK worked
   unchanged, including **native `tool_calls`**. The text-JSON fallback was never needed
   with Qwen3; it's kept for smaller models.
@@ -93,16 +103,24 @@ Tested on a Windows 11 laptop: 16 GB RAM, **NVIDIA MX150 with 2 GB VRAM**.
   sometimes searched the notes correctly. Other times the model said "not available", or
   said "Let me search for it" without actually calling the tool. Follow-up questions in a
   long chat were more likely to skip tools. Answers sometimes contain LaTeX (`$69104$`).
-- **The GPU driver crashed under load.** Partway through a later question, the mimOE engine
-  (`mimoe.exe`) aborted. Afterwards even `nvidia-smi` segfaulted. On restart, the engine's
-  Vulkan backend fell back to the Intel iGPU and crashed while loading tensors (found via
-  `~/.mimoe/.edge/logs/mimoe.log` and the Windows event log). Rebooting reset the driver. The
-  agent now reports "can't reach mimOE" instead of a bare `Connection error`.
+- **4096 wasn't actually safe either. The GPU driver crashed.** Partway through a later
+  question, the mimOE engine (`mimoe.exe`) aborted, and even `nvidia-smi` segfaulted. On
+  restart, the engine's Vulkan backend fell back to the Intel iGPU and crashed while loading
+  tensors. I found this through `~/.mimoe/.edge/logs/mimoe.log` and the Windows event log.
+  The memory math explains it: 1050 MB weights + 448 MB KV cache + ~300 MB compute buffers
+  ≈ 1.8 GB, but only ~1.67 GB was free. The old 2021 driver let Vulkan overcommit until it
+  fell over. After updating the NVIDIA driver (466 → 582), loading fails cleanly instead.
+  **Context 2048** (224 MB KV) fits at ~1.55 GB used. The agent now reports
+  "can't reach mimOE" instead of a bare `Connection error`.
+- **Tool use without and with the nudge.** With the date in the prompt, "What should I do
+  tomorrow?" and "What time is the team standup?" were answered without any tool ("please
+  provide your schedule"). With the one-time nudge, the model searched the notes in every
+  run and answered the standup correctly. Reasoning over the results is still the weak spot:
+  one run said the October 28 dentist appointment was "tomorrow".
 - **The API key is required.** Requests without it return `401 Unauthorized`.
 
 ## Next steps
 - Try mimik's own `@mimik/agent-kit` to compare with the BYO approach.
-- Retry once when the model says it will use a tool but doesn't call one.
 - Try qwen3-4b on a machine with more VRAM and compare tool reliability.
 - Use an embeddings endpoint (if available) for semantic note search.
 - Stream responses; add a simple web UI.
