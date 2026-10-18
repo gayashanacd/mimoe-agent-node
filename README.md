@@ -117,6 +117,12 @@ Tested on a Windows 11 laptop: 16 GB RAM, **NVIDIA MX150 with 2 GB VRAM**.
   provide your schedule"). With the one-time nudge, the model searched the notes in every
   run and answered the standup correctly. Reasoning over the results is still the weak spot:
   one run said the October 28 dentist appointment was "tomorrow".
+- **Wrong local time came from Node, not the model.** Windows' newer "British Columbia
+  Standard Time" zone isn't recognised by Node's ICU, so `new Date()` fell back to UTC-8
+  and was an hour off. Setting `TZ=America/Vancouver` in `.env` fixed it. Separately, the
+  model once stated a made-up time without calling the tool. The prompt now says to always
+  call `get_current_time`. In a long chat it may still reuse an earlier result instead of
+  calling the tool again.
 - **The API key is required.** Requests without it return `401 Unauthorized`.
 
 ## Next steps
