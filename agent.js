@@ -114,6 +114,16 @@ export async function runAgent(userInput, history) {
   return "Stopped: reached the maximum number of reasoning steps.";
 }
 
+// Turn SDK errors into a hint about what to check in mimOE Studio.
+function explainError(e) {
+  if (e instanceof OpenAI.APIConnectionError) {
+    return `can't reach ${BASE_URL}. Is mimOE Studio running with a model loaded?`;
+  }
+  if (e.status === 401) return "unauthorized. Check MIMOE_API_KEY against Studio's API panel.";
+  if (e.status === 404) return `not found. Is '${MODEL}' loaded? Check MIMOE_MODEL against Studio.`;
+  return e.message;
+}
+
 async function main() {
   const history = [{ role: "system", content: SYSTEM_PROMPT }];
   console.log(`mimOE local agent  |  model=${MODEL}  |  endpoint=${BASE_URL}`);
@@ -135,10 +145,12 @@ async function main() {
     }
     if (["exit", "quit"].includes(userInput.toLowerCase())) break;
     if (!userInput) continue;
+    const turnStart = history.length;
     try {
       console.log("agent>", await runAgent(userInput, history));
     } catch (e) {
-      console.error("error talking to mimOE:", e.message);
+      history.length = turnStart; // drop the failed turn so a retry starts clean
+      console.error("error talking to mimOE:", explainError(e));
     }
   }
   rl.close();
@@ -147,7 +159,7 @@ async function main() {
 // Only start the chat when run directly (not when imported by tests).
 if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith("agent.js")) {
   main().catch((e) => {
-    console.error("Fatal:", e.message);
+    console.error("Fatal:", explainError(e));
     process.exit(1);
   });
 }

@@ -93,6 +93,11 @@ Tested on a Windows 11 laptop: 16 GB RAM, **NVIDIA MX150 with 2 GB VRAM**.
   sometimes searched the notes correctly. Other times the model said "not available", or
   said "Let me search for it" without actually calling the tool. Follow-up questions in a
   long chat were more likely to skip tools. Answers sometimes contain LaTeX (`$69104$`).
+- **The GPU driver crashed under load.** Partway through a later question, the mimOE engine
+  (`mimoe.exe`) aborted. Afterwards even `nvidia-smi` segfaulted. On restart, the engine's
+  Vulkan backend fell back to the Intel iGPU and crashed while loading tensors (found via
+  `~/.mimoe/.edge/logs/mimoe.log` and the Windows event log). Rebooting reset the driver. The
+  agent now reports "can't reach mimOE" instead of a bare `Connection error`.
 - **The API key is required.** Requests without it return `401 Unauthorized`.
 
 ## Next steps
