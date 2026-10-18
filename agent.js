@@ -1,0 +1,153 @@
+// A small tool-using AI agent that runs entirely on-device against
+// mimOE's local, OpenAI-compatible inference endpoint.
+//
+// Approach: "BYO Framework" with raw API calls via the official OpenAI
+// Node SDK. The only thing that changes vs. a cloud model is baseURL.
+//
+// Run:  node agent.js              (interactive chat)
+//       node agent.js "question"   (one-shot)
+
+import "dotenv/config";
+import OpenAI from "openai";
+import readline from "node:readline/promises";
+import { stdin as input, stdout as output } from "node:process";
+import { TOOL_SCHEMAS, runTool } from "./tools.js";
+
+const BASE_URL = process.env.MIMOE_BASE_URL ?? "http://localhost:8083/mimik-ai/openai/v1";
+const API_KEY = process.env.MIMOE_API_KEY ?? "not-needed"; // key from Studio's API panel
+const MODEL = process.env.MIMOE_MODEL ?? "smollm2-360m";   // exact model id from Studio
+const MAX_STEPS = Number(process.env.MAX_STEPS ?? 5);      // guard against infinite tool loops
+const DEBUG = process.env.DEBUG === "1";
+const THINKING = process.env.THINKING === "1";             // Qwen3 reasoning mode (slower, uses more context)
+
+const client = new OpenAI({ baseURL: BASE_URL, apiKey: API_KEY });
+
+export const SYSTEM_PROMPT = `You are a helpful assistant running locally on the user's device.
+You can use these tools: calculator, get_current_time, search_notes.
+Use a tool when the question needs exact math, the current time, or the user's notes.
+The user keeps notes about their appointments, meetings, team routines and deadlines.
+If a question could be answered by those notes, call search_notes before answering; never say the information is unavailable without searching first.
+
+If your runtime supports function calling, call the tool normally.
+Otherwise, to use a tool reply with ONLY a single line of JSON, for example:
+{"tool": "calculator", "arguments": {"expression": "12 * 7"}}
+When you have the final answer, reply in plain text (no JSON).${THINKING ? "" : "\n/no_think"}`;
+
+const log = (...args) => DEBUG && console.error("[debug]", ...args);
+
+// Reasoning models like Qwen3 wrap their thinking in <think>...</think>.
+// Strip it so the user sees only the answer and it doesn't fill the small
+// on-device context window (4096 tokens here) on later turns.
+export function stripThinking(content) {
+  return (content ?? "").replace(/<think>[\s\S]*?(<\/think>|$)/g, "").trim();
+}
+
+// Fallback for small models without native function calling:
+// look for a {"tool": ..., "arguments": ...} JSON object in the text.
+export function parseTextToolCall(content) {
+  const match = (content ?? "").match(/\{[\s\S]*\}/);
+  if (!match) return null;
+  try {
+    const data = JSON.parse(match[0]);
+    if (data && typeof data === "object" && "tool" in data) {
+      return { name: data.tool, args: data.arguments ?? {} };
+    }
+  } catch {
+    /* not JSON — treat as a normal answer */
+  }
+  return null;
+}
+
+// One agent turn: think -> (maybe) act with a tool -> observe -> answer.
+export async function runAgent(userInput, history) {
+  history.push({ role: "user", content: userInput });
+
+  for (let step = 0; step < MAX_STEPS; step++) {
+    const response = await client.chat.completions.create({
+      model: MODEL,
+      messages: history,
+      tools: TOOL_SCHEMAS,
+      temperature: 0.2, // low temperature = more reliable tool use from small models
+    });
+    const msg = response.choices[0].message;
+    log(`step ${step}:`, JSON.stringify(msg));
+    msg.content = stripThinking(msg.content);
+
+    // Path 1: native OpenAI-style tool calls
+    if (msg.tool_calls?.length) {
+      history.push(msg);
+      for (const call of msg.tool_calls) {
+        let args;
+        try {
+          args = JSON.parse(call.function.arguments || "{}");
+        } catch {
+          args = null;
+        }
+        const result = args
+          ? runTool(call.function.name, args)
+          : `error: arguments were not valid JSON: ${call.function.arguments}`;
+        console.log(`  🔧 ${call.function.name}(${JSON.stringify(args)}) -> ${result}`);
+        history.push({ role: "tool", tool_call_id: call.id, content: result });
+      }
+      continue;
+    }
+
+    // Path 2: text-protocol tool call (fallback for small models)
+    const parsed = parseTextToolCall(msg.content);
+    if (parsed) {
+      const result = runTool(parsed.name, parsed.args);
+      console.log(`  🔧 ${parsed.name}(${JSON.stringify(parsed.args)}) -> ${result}`);
+      history.push({ role: "assistant", content: msg.content });
+      history.push({
+        role: "user",
+        content: `Tool result for ${parsed.name}: ${result}\nNow answer the original question in plain text.`,
+      });
+      continue;
+    }
+
+    // Path 3: final answer
+    const answer = msg.content;
+    history.push({ role: "assistant", content: answer });
+    return answer;
+  }
+
+  return "Stopped: reached the maximum number of reasoning steps.";
+}
+
+async function main() {
+  const history = [{ role: "system", content: SYSTEM_PROMPT }];
+  console.log(`mimOE local agent  |  model=${MODEL}  |  endpoint=${BASE_URL}`);
+
+  const question = process.argv.slice(2).join(" ");
+  if (question) {
+    console.log(await runAgent(question, history));
+    return;
+  }
+
+  const rl = readline.createInterface({ input, output });
+  console.log("Type a question (or 'exit').");
+  while (true) {
+    let userInput;
+    try {
+      userInput = (await rl.question("\nyou> ")).trim();
+    } catch {
+      break; // input closed (Ctrl+D / Ctrl+Z / end of piped input)
+    }
+    if (["exit", "quit"].includes(userInput.toLowerCase())) break;
+    if (!userInput) continue;
+    try {
+      console.log("agent>", await runAgent(userInput, history));
+    } catch (e) {
+      console.error("error talking to mimOE:", e.message);
+    }
+  }
+  rl.close();
+}
+
+// Only start the chat when run directly (not when imported by tests).
+if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith("agent.js")) {
+  main().catch((e) => {
+    console.error("Fatal:", e.message);
+    process.exit(1);
+  });
+}

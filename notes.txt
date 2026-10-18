@@ -1,0 +1,5 @@
+Team standup is every weekday at 9:30 AM.
+The project deadline for the edge AI demo is November 14.
+WiFi password for the lab is stored with IT, not here.
+Dentist appointment on October 28 at 3 PM.
+mimOE runs models on-device so data does not leave the machine.
